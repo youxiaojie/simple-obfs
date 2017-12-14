@@ -41,12 +41,10 @@
 #include <errno.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
-#include <pthread.h>
 #include <sys/un.h>
 #endif
 
 #include <libcork/core.h>
-#include <udns.h>
 
 #ifdef __MINGW32__
 #include "win32.h"
@@ -62,6 +60,7 @@
 #include "utils.h"
 #include "obfs_http.h"
 #include "obfs_tls.h"
+#include "options.h"
 #include "server.h"
 
 #ifndef EAGAIN
@@ -73,15 +72,11 @@
 #endif
 
 #ifndef BUF_SIZE
-#define BUF_SIZE 2048
+#define BUF_SIZE 16384
 #endif
 
 #ifndef SSMAXCONN
 #define SSMAXCONN 1024
-#endif
-
-#ifndef UPDATE_INTERVAL
-#define UPDATE_INTERVAL 30
 #endif
 
 static void signal_cb(EV_P_ ev_signal *w, int revents);
@@ -92,6 +87,7 @@ static void remote_recv_cb(EV_P_ ev_io *w, int revents);
 static void remote_send_cb(EV_P_ ev_io *w, int revents);
 static void server_timeout_cb(EV_P_ ev_timer *watcher, int revents);
 
+static void perform_handshake(EV_P_ server_t *server);
 static remote_t *new_remote(int fd);
 static server_t *new_server(int fd, listen_ctx_t *listener);
 static remote_t *connect_to_remote(EV_P_ struct addrinfo *res,
@@ -101,12 +97,11 @@ static void free_remote(remote_t *remote);
 static void close_and_free_remote(EV_P_ remote_t *remote);
 static void free_server(server_t *server);
 static void close_and_free_server(EV_P_ server_t *server);
-static void server_resolve_cb(struct sockaddr *addr, void *data);
-static void query_free_cb(void *data);
 
 int verbose = 0;
 
 static int ipv6first = 0;
+static int reverse_proxy = 0;
 static int fast_open = 0;
 
 static obfs_para_t *obfs_para = NULL;
@@ -123,6 +118,21 @@ uint64_t tx                  = 0;
 uint64_t rx                  = 0;
 
 static struct cork_dllist connections;
+
+static void
+parent_watcher_cb(EV_P_ ev_timer *watcher, int revents)
+{
+    static int ppid = -1;
+
+    int cur_ppid = getppid();
+    if (ppid != -1) {
+        if (ppid != cur_ppid) {
+            ev_unloop(EV_A_ EVUNLOOP_ALL);
+        }
+    }
+
+    ppid = cur_ppid;
+}
 
 static void
 free_connections(struct ev_loop *loop)
@@ -381,6 +391,109 @@ connect_to_remote(EV_P_ struct addrinfo *res,
 }
 
 static void
+perform_handshake(EV_P_ server_t *server)
+{
+    // Copy back the saved first packet
+    server->buf->len = server->header_buf->len;
+    server->buf->idx = server->header_buf->idx;
+    memcpy(server->buf->data, server->header_buf->data, server->header_buf->len);
+    server->header_buf->idx = server->header_buf->len = 0;
+
+    struct addrinfo info;
+    struct sockaddr_storage storage;
+    memset(&info, 0, sizeof(struct addrinfo));
+    memset(&storage, 0, sizeof(struct sockaddr_storage));
+
+    // Domain name
+    size_t name_len = strlen(server->listen_ctx->dst_addr->host);
+    char *host = server->listen_ctx->dst_addr->host;
+    uint16_t port = htons((uint16_t)atoi(server->listen_ctx->dst_addr->port));
+
+    if (obfs_para == NULL || !obfs_para->is_enable(server->obfs)) {
+        if (server->listen_ctx->failover->host != NULL
+                && server->listen_ctx->failover->port != NULL) {
+            name_len = strlen(server->listen_ctx->failover->host);
+            host = server->listen_ctx->failover->host;
+            port = htons((uint16_t)atoi(server->listen_ctx->failover->port));
+        }
+    }
+
+    struct cork_ip ip;
+    if (cork_ip_init(&ip, host) != -1) {
+        if (ip.version == 4) {
+            struct sockaddr_in *addr = (struct sockaddr_in *)&storage;
+            inet_pton(AF_INET, host, &(addr->sin_addr));
+            addr->sin_port   = port;
+            addr->sin_family = AF_INET;
+        } else if (ip.version == 6) {
+            struct sockaddr_in6 *addr = (struct sockaddr_in6 *)&storage;
+            inet_pton(AF_INET6, host, &(addr->sin6_addr));
+            addr->sin6_port   = port;
+            addr->sin6_family = AF_INET6;
+        }
+    } else {
+        if (!validate_hostname(host, name_len)) {
+            LOGE("invalid host name");
+            close_and_free_server(EV_A_ server);
+            return;
+        }
+        char tmp_port[16];
+        snprintf(tmp_port, 16, "%d", ntohs(port));
+        if (get_sockaddr(host, tmp_port, &storage, 0, ipv6first) == -1) {
+            LOGE("failed to resolve the provided hostname");
+            close_and_free_server(EV_A_ server);
+            return;
+        }
+    }
+
+    info.ai_socktype = SOCK_STREAM;
+    info.ai_protocol = IPPROTO_TCP;
+
+    if (storage.ss_family == AF_INET) {
+        info.ai_family   = AF_INET;
+        info.ai_addrlen  = sizeof(struct sockaddr_in);
+        info.ai_addr     = (struct sockaddr *)&storage;
+    } else if (storage.ss_family == AF_INET6) {
+        info.ai_family   = AF_INET6;
+        info.ai_addrlen  = sizeof(struct sockaddr_in6);
+        info.ai_addr     = (struct sockaddr *)&storage;
+    } else {
+        LOGE("failed to resolve the provided hostname");
+        close_and_free_server(EV_A_ server);
+        return;
+    }
+
+    if (verbose) {
+        LOGI("connect to %s:%d", host, ntohs(port));
+    }
+
+    remote_t *remote = connect_to_remote(EV_A_ & info, server);
+
+    if (remote == NULL) {
+        LOGE("connect error");
+        close_and_free_server(EV_A_ server);
+        return;
+    } else {
+        server->remote = remote;
+        remote->server = server;
+
+        // XXX: should handle buffer carefully
+        if (server->buf->len > 0) {
+            memcpy(remote->buf->data, server->buf->data, server->buf->len);
+            remote->buf->len = server->buf->len;
+            remote->buf->idx = 0;
+            server->buf->len = 0;
+            server->buf->idx = 0;
+        }
+
+        // waiting on remote connected event
+        ev_io_start(EV_A_ & remote->send_ctx->io);
+    }
+
+    return;
+}
+
+static void
 server_recv_cb(EV_P_ ev_io *w, int revents)
 {
     server_ctx_t *server_recv_ctx = (server_ctx_t *)w;
@@ -438,16 +551,60 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
             int ret = obfs_para->check_obfs(buf);
             if (ret == OBFS_NEED_MORE) {
                 return;
-            } else if (ret) {
+            } else if (ret == OBFS_OK) {
                 // obfs is enabled
                 ret = obfs_para->deobfs_request(buf, BUF_SIZE, server->obfs);
                 if (ret == OBFS_NEED_MORE)
                     return;
+                else if (ret == OBFS_ERROR)
+                    obfs_para->disable(server->obfs);
             } else {
                 obfs_para->disable(server->obfs);
             }
         }
+
         server->stage = STAGE_HANDSHAKE;
+        ev_io_stop(EV_A_ & server->recv_ctx->io);
+
+        // Copy the first packet to the currently unused header_buf.
+        server->header_buf->len = server->buf->len - server->buf->idx;
+        server->header_buf->idx = 0;
+        memcpy(server->header_buf->data, server->buf->data + server->buf->idx, server->header_buf->len);
+        if (reverse_proxy && obfs_para->send_empty_response_upon_connection) {
+            // Clear the buffer to make an empty packet.
+            server->buf->len = 0;
+
+            if (obfs_para) {
+                obfs_para->obfs_response(server->buf, BUF_SIZE, server->obfs);
+            }
+
+            int s = send(server->fd, server->buf->data, server->buf->len, 0);
+
+            if (s == -1) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    // no data, wait for send
+                    server->buf->idx = 0;
+                    ev_io_start(EV_A_ & server->send_ctx->io);
+                    return;
+                } else {
+                    ERROR("send_inital_response");
+                    close_and_free_remote(EV_A_ remote);
+                    close_and_free_server(EV_A_ server);
+                    return;
+                }
+            } else if (s < server->buf->len) {
+                server->buf->len -= s;
+                server->buf->idx  = s;
+                ev_io_start(EV_A_ & server->send_ctx->io);
+                return;
+            } else {
+                server->buf->len = 0;
+                server->buf->idx = 0;
+            }
+        }
+
+        perform_handshake(EV_A_ server);
+        return;
     } else {
         buf->len = r;
         if (obfs_para) {
@@ -479,91 +636,6 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
         }
         return;
 
-    } else if (server->stage == STAGE_HANDSHAKE) {
-
-        int need_query = 0;
-        struct addrinfo info;
-        struct sockaddr_storage storage;
-        memset(&info, 0, sizeof(struct addrinfo));
-        memset(&storage, 0, sizeof(struct sockaddr_storage));
-
-        // Domain name
-        size_t name_len = strlen(server->listen_ctx->dst_addr->host);
-        char *host = server->listen_ctx->dst_addr->host;
-        uint16_t port = htons((uint16_t)atoi(server->listen_ctx->dst_addr->port));
-
-        struct cork_ip ip;
-        if (cork_ip_init(&ip, host) != -1) {
-            info.ai_socktype = SOCK_STREAM;
-            info.ai_protocol = IPPROTO_TCP;
-            if (ip.version == 4) {
-                struct sockaddr_in *addr = (struct sockaddr_in *)&storage;
-                dns_pton(AF_INET, host, &(addr->sin_addr));
-                addr->sin_port   = port;
-                addr->sin_family = AF_INET;
-                info.ai_family   = AF_INET;
-                info.ai_addrlen  = sizeof(struct sockaddr_in);
-                info.ai_addr     = (struct sockaddr *)addr;
-            } else if (ip.version == 6) {
-                struct sockaddr_in6 *addr = (struct sockaddr_in6 *)&storage;
-                dns_pton(AF_INET6, host, &(addr->sin6_addr));
-                addr->sin6_port   = port;
-                addr->sin6_family = AF_INET6;
-                info.ai_family    = AF_INET6;
-                info.ai_addrlen   = sizeof(struct sockaddr_in6);
-                info.ai_addr      = (struct sockaddr *)addr;
-            }
-        } else {
-            if (!validate_hostname(host, name_len)) {
-                LOGE("invalid host name");
-                close_and_free_server(EV_A_ server);
-                return;
-            }
-            need_query = 1;
-        }
-
-        if (verbose) {
-            LOGI("connect to %s:%d", host, ntohs(port));
-        }
-
-        if (!need_query) {
-            remote_t *remote = connect_to_remote(EV_A_ & info, server);
-
-            if (remote == NULL) {
-                LOGE("connect error");
-                close_and_free_server(EV_A_ server);
-                return;
-            } else {
-                server->remote = remote;
-                remote->server = server;
-
-                // XXX: should handle buffer carefully
-                if (server->buf->len > 0) {
-                    memcpy(remote->buf->data, server->buf->data, server->buf->len);
-                    remote->buf->len = server->buf->len;
-                    remote->buf->idx = 0;
-                    server->buf->len = 0;
-                    server->buf->idx = 0;
-                }
-
-                // waiting on remote connected event
-                ev_io_stop(EV_A_ & server_recv_ctx->io);
-                ev_io_start(EV_A_ & remote->send_ctx->io);
-            }
-        } else {
-            query_t *query = ss_malloc(sizeof(query_t));
-            memset(query, 0, sizeof(query_t));
-            query->server = server;
-            snprintf(query->hostname, 256, "%s", host);
-
-            server->stage = STAGE_RESOLVE;
-            server->query = resolv_query(host, server_resolve_cb,
-                                         query_free_cb, query, port);
-
-            ev_io_stop(EV_A_ & server_recv_ctx->io);
-        }
-
-        return;
     }
     // should not reach here
     FATAL("server context error");
@@ -611,14 +683,21 @@ server_send_cb(EV_P_ ev_io *w, int revents)
             server->buf->len = 0;
             server->buf->idx = 0;
             ev_io_stop(EV_A_ & server_send_ctx->io);
-            if (remote != NULL) {
-                ev_io_start(EV_A_ & remote->recv_ctx->io);
+
+            // If handshaking
+            if (server->stage == STAGE_HANDSHAKE) {
+                perform_handshake(EV_A_ server);
                 return;
-            } else {
-                LOGE("invalid remote");
-                close_and_free_remote(EV_A_ remote);
-                close_and_free_server(EV_A_ server);
-                return;
+            } else { // If streaming
+                if (remote != NULL) {
+                    ev_io_start(EV_A_ & remote->recv_ctx->io);
+                    return;
+                } else {
+                    LOGE("invalid remote");
+                    close_and_free_remote(EV_A_ remote);
+                    close_and_free_server(EV_A_ server);
+                    return;
+                }
             }
         }
     }
@@ -638,69 +717,6 @@ server_timeout_cb(EV_P_ ev_timer *watcher, int revents)
 
     close_and_free_remote(EV_A_ remote);
     close_and_free_server(EV_A_ server);
-}
-
-static void
-query_free_cb(void *data)
-{
-    if (data != NULL) {
-        ss_free(data);
-    }
-}
-
-static void
-server_resolve_cb(struct sockaddr *addr, void *data)
-{
-    query_t *query       = (query_t *)data;
-    server_t *server     = query->server;
-    struct ev_loop *loop = server->listen_ctx->loop;
-
-    server->query = NULL;
-
-    if (addr == NULL) {
-        LOGE("unable to resolve %s", query->hostname);
-        close_and_free_server(EV_A_ server);
-    } else {
-        if (verbose) {
-            LOGI("successfully resolved %s", query->hostname);
-        }
-
-        struct addrinfo info;
-        memset(&info, 0, sizeof(struct addrinfo));
-        info.ai_socktype = SOCK_STREAM;
-        info.ai_protocol = IPPROTO_TCP;
-        info.ai_addr     = addr;
-
-        if (addr->sa_family == AF_INET) {
-            info.ai_family  = AF_INET;
-            info.ai_addrlen = sizeof(struct sockaddr_in);
-        } else if (addr->sa_family == AF_INET6) {
-            info.ai_family  = AF_INET6;
-            info.ai_addrlen = sizeof(struct sockaddr_in6);
-        }
-
-        remote_t *remote = connect_to_remote(EV_A_ & info, server);
-
-        if (remote == NULL) {
-            close_and_free_server(EV_A_ server);
-        } else {
-            server->remote = remote;
-            remote->server = server;
-
-            // XXX: should handle buffer carefully
-            if (server->buf->len > 0) {
-                memcpy(remote->buf->data, server->buf->data + server->buf->idx,
-                       server->buf->len);
-                remote->buf->len = server->buf->len;
-                remote->buf->idx = 0;
-                server->buf->len = 0;
-                server->buf->idx = 0;
-            }
-
-            // listen to remote connected event
-            ev_io_start(EV_A_ & remote->send_ctx->io);
-        }
-    }
 }
 
 static void
@@ -950,7 +966,6 @@ new_server(int fd, listen_ctx_t *listener)
     server->send_ctx->server    = server;
     server->send_ctx->connected = 0;
     server->stage               = STAGE_INIT;
-    server->query               = NULL;
     server->listen_ctx          = listener;
     server->remote              = NULL;
 
@@ -1004,10 +1019,6 @@ static void
 close_and_free_server(EV_P_ server_t *server)
 {
     if (server != NULL) {
-        if (server->query != NULL) {
-            resolv_cancel(server->query);
-            server->query = NULL;
-        }
         ev_io_stop(EV_A_ & server->send_ctx->io);
         ev_io_stop(EV_A_ & server->recv_ctx->io);
         ev_timer_stop(EV_A_ & server->recv_ctx->watcher);
@@ -1073,16 +1084,19 @@ main(int argc, char **argv)
     int server_num = 0;
     const char *server_host[MAX_REMOTE_NUM];
 
-    char *nameservers[MAX_DNS_NUM + 1];
-    int nameserver_num = 0;
+    char *nameservers = NULL;
 
     ss_addr_t dst_addr = { .host = NULL, .port = NULL };
     char *dst_addr_str = NULL;
+    ss_addr_t failover = { .host = NULL, .port = NULL };
+    char *failover_str = NULL;
+    char *obfs_host = NULL;
 
     char *ss_remote_host = getenv("SS_REMOTE_HOST");
     char *ss_remote_port = getenv("SS_REMOTE_PORT");
     char *ss_local_host  = getenv("SS_LOCAL_HOST");
     char *ss_local_port  = getenv("SS_LOCAL_PORT");
+    char *ss_plugin_opts = getenv("SS_PLUGIN_OPTIONS");
 
     if (ss_remote_host != NULL) {
         ss_remote_host = strdup(ss_remote_host);
@@ -1105,14 +1119,77 @@ main(int argc, char **argv)
         dst_addr.port =  ss_local_port;
     }
 
+    if (ss_plugin_opts != NULL) {
+        ss_plugin_opts = strdup(ss_plugin_opts);
+        options_t opts;
+        int opt_num = parse_options(ss_plugin_opts,
+                strlen(ss_plugin_opts), &opts);
+        for (i = 0; i < opt_num; i++) {
+            char *key = opts.keys[i];
+            char *value = opts.values[i];
+            if (key == NULL) continue;
+            size_t key_len = strlen(key);
+            if (key_len == 0) continue;
+            if (key_len == 1) {
+                char c = key[0];
+                switch (c) {
+                    case 'b':
+                        bind_address = value;
+                        break;
+                    case 't':
+                        timeout = value;
+                        break;
+                    case 'c':
+                        conf_path = value;
+                        break;
+                    case 'i':
+                        iface = value;
+                        break;
+                    case 'a':
+                        user = value;
+                        break;
+                    case 'v':
+                        verbose = 1;
+                        break;
+                    case '6':
+                        ipv6first = 1;
+                        break;
+                    }
+            } else {
+                if (strcmp(key, "fast-open") == 0) {
+                    fast_open = 1;
+                } else if (strcmp(key, "obfs") == 0) {
+                    if (strcmp(value, obfs_http->name) == 0)
+                        obfs_para = obfs_http;
+                    else if (strcmp(value, obfs_tls->name) == 0)
+                        obfs_para = obfs_tls;
+                } else if (strcmp(key, "obfs-host") == 0) {
+                    obfs_host = value;
+                } else if (strcmp(key, "failover") == 0) {
+                    failover_str = value;
+                } else if (strcmp(key, "reverse_proxy") == 0) {
+                    reverse_proxy = 1;
+#ifdef __linux__
+                } else if (strcmp(key, "mptcp") == 0) {
+                    mptcp = 1;
+                    LOGI("enable multipath TCP");
+#endif
+                }
+            }
+        }
+    }
+
     int option_index                    = 0;
     static struct option long_options[] = {
         { "fast-open",       no_argument,       0, 0 },
         { "help",            no_argument,       0, 0 },
         { "obfs",            required_argument, 0, 0 },
+        { "obfs-host",       required_argument, 0, 0 },
+        { "failover",        required_argument, 0, 0 },
 #ifdef __linux__
         { "mptcp",           no_argument,       0, 0 },
 #endif
+        { "reverse_proxy",   no_argument,       0, 0 },
         { 0,                 0,                 0, 0 }
     };
 
@@ -1135,8 +1212,15 @@ main(int argc, char **argv)
                 else if (strcmp(optarg, obfs_tls->name) == 0)
                     obfs_para = obfs_tls;
             } else if (option_index == 3) {
+                obfs_host = optarg;
+            } else if (option_index == 4) {
+                failover_str = optarg;
+            } else if (option_index == 5) {
                 mptcp = 1;
                 LOGI("enable multipath TCP");
+            } else if (option_index == 6) {
+                reverse_proxy = 1;
+                LOGI("enable reverse proxy");
             }
             break;
         case 's':
@@ -1167,9 +1251,7 @@ main(int argc, char **argv)
             iface = optarg;
             break;
         case 'd':
-            if (nameserver_num < MAX_DNS_NUM) {
-                nameservers[nameserver_num++] = optarg;
-            }
+            nameservers = optarg;
             break;
         case 'a':
             user = optarg;
@@ -1201,12 +1283,6 @@ main(int argc, char **argv)
         exit(EXIT_FAILURE);
     }
 
-    if (argc == 1) {
-        if (conf_path == NULL) {
-            conf_path = DEFAULT_CONF_PATH;
-        }
-    }
-
     if (conf_path != NULL) {
         jconf_t *conf = read_jconf(conf_path);
         if (server_num == 0) {
@@ -1226,11 +1302,17 @@ main(int argc, char **argv)
         if (dst_addr_str == NULL) {
             dst_addr_str = conf->dst_addr;
         }
+        if (failover_str == NULL) {
+            failover_str = conf->failover;
+        }
         if (obfs_para == NULL && conf->obfs != NULL) {
             if (strcmp(conf->obfs, obfs_http->name) == 0)
                 obfs_para = obfs_http;
             else if (strcmp(conf->obfs, obfs_tls->name) == 0)
                 obfs_para = obfs_tls;
+        }
+        if (obfs_host == NULL) {
+            obfs_host = conf->obfs_host;
         }
         if (mptcp == 0) {
             mptcp = conf->mptcp;
@@ -1245,11 +1327,14 @@ main(int argc, char **argv)
             nofile = conf->nofile;
         }
 #endif
-        if (conf->nameserver != NULL) {
-            nameservers[nameserver_num++] = conf->nameserver;
+        if (nameservers == NULL) {
+            nameservers = conf->nameserver;
         }
         if (ipv6first == 0) {
             ipv6first = conf->ipv6_first;
+        }
+        if (reverse_proxy == 0) {
+            reverse_proxy = conf->reverse_proxy;
         }
     }
 
@@ -1271,9 +1356,13 @@ main(int argc, char **argv)
         FATAL("forwarding destination is not defined");
     }
 
+    if (failover_str != NULL) {
+        // parse failover addr
+        parse_addr(failover_str, &failover);
+    }
 
     if (timeout == NULL) {
-        timeout = "60";
+        timeout = "600";
     }
 
 #ifdef HAVE_SETRLIMIT
@@ -1308,7 +1397,10 @@ main(int argc, char **argv)
     }
 
     if (obfs_para) {
+        obfs_para->host = obfs_host;
         LOGI("obfuscating enabled");
+        if (obfs_host)
+            LOGI("obfuscating hostname: %s", obfs_host);
     }
 
 #ifdef __MINGW32__
@@ -1330,20 +1422,8 @@ main(int argc, char **argv)
     // initialize ev loop
     struct ev_loop *loop = EV_DEFAULT;
 
-    // setup udns
-    if (nameserver_num == 0) {
-#ifdef __MINGW32__
-        nameservers[nameserver_num++] = "8.8.8.8";
-        resolv_init(loop, nameservers, nameserver_num, ipv6first);
-#else
-        resolv_init(loop, NULL, 0, ipv6first);
-#endif
-    } else {
-        resolv_init(loop, nameservers, nameserver_num, ipv6first);
-    }
-
-    for (int i = 0; i < nameserver_num; i++)
-        LOGI("using nameserver: %s", nameservers[i]);
+    if (nameservers != NULL)
+        LOGI("using nameserver: %s", nameservers);
 
     // initialize listen context
     listen_ctx_t listen_ctx_list[server_num];
@@ -1373,6 +1453,7 @@ main(int argc, char **argv)
         listen_ctx->loop    = loop;
 
         listen_ctx->dst_addr = &dst_addr;
+        listen_ctx->failover = &failover;
 
         ev_io_init(&listen_ctx->io, accept_cb, listenfd, EV_READ);
         ev_io_start(loop, &listen_ctx->io);
@@ -1397,6 +1478,10 @@ main(int argc, char **argv)
     // Init connections
     cork_dllist_init(&connections);
 
+    ev_timer parent_watcher;
+    ev_timer_init(&parent_watcher, parent_watcher_cb, 0, UPDATE_INTERVAL);
+    ev_timer_start(EV_DEFAULT, &parent_watcher);
+
     // start ev loop
     ev_run(loop, 0);
 
@@ -1412,8 +1497,6 @@ main(int argc, char **argv)
     }
 
     free_connections(loop);
-
-    resolv_shutdown(loop);
 
 #ifdef __MINGW32__
     winsock_cleanup();

@@ -29,7 +29,6 @@
 
 #include "encrypt.h"
 #include "jconf.h"
-#include "resolv.h"
 
 #include "common.h"
 
@@ -39,6 +38,7 @@ typedef struct listen_ctx {
     int timeout;
     int method;
     ss_addr_t *dst_addr;
+    ss_addr_t *failover;
     char *iface;
     struct ev_loop *loop;
 } listen_ctx_t;
@@ -65,15 +65,8 @@ typedef struct server {
     struct listen_ctx *listen_ctx;
     struct remote *remote;
 
-    struct ResolvQuery *query;
-
     struct cork_dllist_item entries;
 } server_t;
-
-typedef struct query {
-    server_t *server;
-    char hostname[257];
-} query_t;
 
 typedef struct remote_ctx {
     ev_io io;

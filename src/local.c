@@ -39,7 +39,6 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
-#include <pthread.h>
 #endif
 
 #if defined(HAVE_SYS_IOCTL_H) && defined(HAVE_NET_IF_H) && defined(__linux__)
@@ -49,16 +48,19 @@
 #endif
 
 #include <libcork/core.h>
-#include <udns.h>
 
 #ifdef __MINGW32__
 #include "win32.h"
+#define __ev_io_init(a, b, c, d) ev_io_init(a, b, _open_osfhandle(c, 0), d)
+#else
+#define __ev_io_init(a, b, c, d) ev_io_init(a, b, c, d)
 #endif
 
 #include "netutils.h"
 #include "utils.h"
 #include "obfs_http.h"
 #include "obfs_tls.h"
+#include "options.h"
 #include "local.h"
 
 #ifdef __APPLE__
@@ -89,7 +91,6 @@ int vpn        = 0;
 uint64_t tx    = 0;
 uint64_t rx    = 0;
 ev_tstamp last = 0;
-char *prefix;
 #endif
 
 static int ipv6first = 0;
@@ -106,7 +107,9 @@ static void server_send_cb(EV_P_ ev_io *w, int revents);
 static void remote_recv_cb(EV_P_ ev_io *w, int revents);
 static void remote_send_cb(EV_P_ ev_io *w, int revents);
 static void accept_cb(EV_P_ ev_io *w, int revents);
+#ifndef __MINGW32__
 static void signal_cb(EV_P_ ev_signal *w, int revents);
+#endif
 
 static int create_and_bind(const char *addr, const char *port);
 #ifdef HAVE_LAUNCHD
@@ -134,6 +137,21 @@ setnonblocking(int fd)
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
+static void
+parent_watcher_cb(EV_P_ ev_timer *watcher, int revents)
+{
+    static int ppid = -1;
+
+    int cur_ppid = getppid();
+    if (ppid != -1) {
+        if (ppid != cur_ppid) {
+            keep_resolving = 0;
+            ev_unloop(EV_A_ EVUNLOOP_ALL);
+        }
+    }
+
+    ppid = cur_ppid;
+}
 #endif
 
 int
@@ -654,8 +672,8 @@ new_remote(int fd, int timeout)
     remote->recv_ctx->remote    = remote;
     remote->send_ctx->remote    = remote;
 
-    ev_io_init(&remote->recv_ctx->io, remote_recv_cb, fd, EV_READ);
-    ev_io_init(&remote->send_ctx->io, remote_send_cb, fd, EV_WRITE);
+    __ev_io_init(&remote->recv_ctx->io, remote_recv_cb, fd, EV_READ);
+    __ev_io_init(&remote->send_ctx->io, remote_send_cb, fd, EV_WRITE);
     ev_timer_init(&remote->send_ctx->watcher, remote_timeout_cb,
                   min(MAX_CONNECT_TIMEOUT, timeout), 0);
     ev_timer_init(&remote->recv_ctx->watcher, remote_timeout_cb,
@@ -718,8 +736,8 @@ new_server(int fd)
         memset(server->obfs, 0, sizeof(obfs_t));
     }
 
-    ev_io_init(&server->recv_ctx->io, server_recv_cb, fd, EV_READ);
-    ev_io_init(&server->send_ctx->io, server_send_cb, fd, EV_WRITE);
+    __ev_io_init(&server->recv_ctx->io, server_recv_cb, fd, EV_READ);
+    __ev_io_init(&server->send_ctx->io, server_send_cb, fd, EV_WRITE);
 
     cork_dllist_add(&connections, &server->entries);
 
@@ -809,6 +827,7 @@ create_remote(listen_ctx_t *listener,
     return remote;
 }
 
+#ifndef __MINGW32__
 static void
 signal_cb(EV_P_ ev_signal *w, int revents)
 {
@@ -816,13 +835,13 @@ signal_cb(EV_P_ ev_signal *w, int revents)
         switch (w->signum) {
         case SIGINT:
         case SIGTERM:
-#ifndef __MINGW32__
         case SIGUSR1:
-#endif
+            keep_resolving = 0;
             ev_unloop(EV_A_ EVUNLOOP_ALL);
         }
     }
 }
+#endif
 
 void
 accept_cb(EV_P_ ev_io *w, int revents)
@@ -844,12 +863,6 @@ accept_cb(EV_P_ ev_io *w, int revents)
     server->listener = listener;
 
     ev_io_start(EV_A_ & server->recv_ctx->io);
-}
-
-void
-resolve_int_cb(int dummy)
-{
-    keep_resolving = 0;
 }
 
 int
@@ -877,13 +890,15 @@ main(int argc, char **argv)
     char *ss_remote_port = getenv("SS_REMOTE_PORT");
     char *ss_local_host  = getenv("SS_LOCAL_HOST");
     char *ss_local_port  = getenv("SS_LOCAL_PORT");
+    char *ss_plugin_opts = getenv("SS_PLUGIN_OPTIONS");
 
     if (ss_remote_host != NULL) {
         ss_remote_host = strdup(ss_remote_host);
         char *delim = "|";
         char *p = strtok(ss_remote_host, delim);
         do {
-            remote_addr[remote_num++].host = p;
+            remote_addr[remote_num].host = p;
+            remote_addr[remote_num++].port = NULL;
         } while ((p = strtok(NULL, delim)));
     }
 
@@ -899,6 +914,63 @@ main(int argc, char **argv)
         local_port = ss_local_port;
     }
 
+    if (ss_plugin_opts != NULL) {
+        ss_plugin_opts = strdup(ss_plugin_opts);
+        options_t opts;
+        int opt_num = parse_options(ss_plugin_opts,
+                strlen(ss_plugin_opts), &opts);
+        for (i = 0; i < opt_num; i++) {
+            char *key = opts.keys[i];
+            char *value = opts.values[i];
+            if (key == NULL) continue;
+            size_t key_len = strlen(key);
+            if (key_len == 0) continue;
+            if (key_len == 1) {
+                char c = key[0];
+                switch (c) {
+                    case 't':
+                        timeout = value;
+                        break;
+                    case 'c':
+                        conf_path = value;
+                        break;
+                    case 'i':
+                        iface = value;
+                        break;
+                    case 'a':
+                        user = value;
+                        break;
+                    case 'v':
+                        verbose = 1;
+                        break;
+#ifdef ANDROID
+                    case 'V':
+                        vpn = 1;
+                        break;
+#endif
+                    case '6':
+                        ipv6first = 1;
+                        break;
+                    }
+            } else {
+                if (strcmp(key, "fast-open") == 0) {
+                    fast_open = 1;
+                } else if (strcmp(key, "obfs") == 0) {
+                    if (strcmp(value, obfs_http->name) == 0)
+                        obfs_para = obfs_http;
+                    else if (strcmp(value, obfs_tls->name) == 0)
+                        obfs_para = obfs_tls;
+                } else if (strcmp(key, "obfs-host") == 0) {
+                    obfs_host = value;
+#ifdef __linux__
+                } else if (strcmp(key, "mptcp") == 0) {
+                    mptcp = 1;
+                    LOGI("enable multipath TCP");
+#endif
+                }
+            }
+        }
+    }
 
     int option_index = 0;
 
@@ -916,7 +988,7 @@ main(int argc, char **argv)
     USE_TTY();
 
 #ifdef ANDROID
-    while ((c = getopt_long(argc, argv, "f:s:p:l:t:i:c:b:a:n:P:hvV6",
+    while ((c = getopt_long(argc, argv, "f:s:p:l:t:i:c:b:a:n:hvV6",
                             long_options, &option_index)) != -1) {
 #else
     while ((c = getopt_long(argc, argv, "f:s:p:l:t:i:c:b:a:n:hv6",
@@ -990,9 +1062,6 @@ main(int argc, char **argv)
         case 'V':
             vpn = 1;
             break;
-        case 'P':
-            prefix = optarg;
-            break;
 #endif
         case '?':
             // The option character is not recognized.
@@ -1007,11 +1076,6 @@ main(int argc, char **argv)
         exit(EXIT_FAILURE);
     }
 
-    if (argc == 1) {
-        if (conf_path == NULL) {
-            conf_path = DEFAULT_CONF_PATH;
-        }
-    }
     if (conf_path != NULL) {
         jconf_t *conf = read_jconf(conf_path);
         if (remote_num == 0) {
@@ -1066,7 +1130,7 @@ main(int argc, char **argv)
     }
 
     if (timeout == NULL) {
-        timeout = "60";
+        timeout = "600";
     }
 
 #ifdef HAVE_SETRLIMIT
@@ -1111,7 +1175,8 @@ main(int argc, char **argv)
             obfs_para->host = "cloudfront.net";
         obfs_para->port = atoi(remote_port);
         LOGI("obfuscating enabled");
-        LOGI("obfuscating hostname: %s", obfs_host);
+        if (obfs_host)
+            LOGI("obfuscating hostname: %s", obfs_host);
     }
 
 #ifdef __MINGW32__
@@ -1120,8 +1185,6 @@ main(int argc, char **argv)
     // ignore SIGPIPE
     signal(SIGPIPE, SIG_IGN);
     signal(SIGABRT, SIG_IGN);
-    signal(SIGINT, resolve_int_cb);
-    signal(SIGTERM, resolve_int_cb);
 #endif
 
     // Setup proxy context
@@ -1144,6 +1207,7 @@ main(int argc, char **argv)
     listen_ctx.iface   = iface;
     listen_ctx.mptcp   = mptcp;
 
+#ifndef __MINGW32__
     // Setup signal handler
     struct ev_signal sigint_watcher;
     struct ev_signal sigterm_watcher;
@@ -1151,6 +1215,13 @@ main(int argc, char **argv)
     ev_signal_init(&sigterm_watcher, signal_cb, SIGTERM);
     ev_signal_start(EV_DEFAULT, &sigint_watcher);
     ev_signal_start(EV_DEFAULT, &sigterm_watcher);
+#endif
+
+#ifndef __MINGW32__
+    ev_timer parent_watcher;
+    ev_timer_init(&parent_watcher, parent_watcher_cb, 0, UPDATE_INTERVAL);
+    ev_timer_start(EV_DEFAULT, &parent_watcher);
+#endif
 
     struct ev_loop *loop = EV_DEFAULT;
 
@@ -1171,7 +1242,7 @@ main(int argc, char **argv)
 
     listen_ctx.fd = listenfd;
 
-    ev_io_init(&listen_ctx.io, accept_cb, listenfd, EV_READ);
+    __ev_io_init(&listen_ctx.io, accept_cb, listenfd, EV_READ);
     ev_io_start(loop, &listen_ctx.io);
 
 #ifdef HAVE_LAUNCHD
@@ -1215,10 +1286,10 @@ main(int argc, char **argv)
 
 #ifdef __MINGW32__
     winsock_cleanup();
-#endif
-
+#else
     ev_signal_stop(EV_DEFAULT, &sigint_watcher);
     ev_signal_stop(EV_DEFAULT, &sigterm_watcher);
+#endif
 
     return 0;
 }

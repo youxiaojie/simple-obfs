@@ -2,7 +2,7 @@ dnl                                               -*- Autoconf -*-
 dnl Process this file with autoconf to produce a configure script.
 
 AC_PREREQ([2.67])
-AC_INIT([simple-obfs], [0.0.1], [max.c.lv@gmail.com])
+AC_INIT([simple-obfs], [0.0.5], [max.c.lv@gmail.com])
 AC_CONFIG_SRCDIR([src/encrypt.c])
 AC_CONFIG_HEADERS([config.h])
 AC_CONFIG_AUX_DIR(auto)
@@ -20,18 +20,6 @@ AC_DISABLE_STATIC
 AC_DISABLE_SHARED
 LT_INIT([dlopen])
 
-dnl Checks for using shared libraries from system
-AC_ARG_ENABLE(
-  [system-shared-lib],
-  AS_HELP_STRING([--enable-system-shared-lib], [build against shared libraries when possible]),
-  [
-    case "${enableval}" in
-      yes) enable_system_shared_lib=true ;;
-      no) enable_system_shared_lib=false ;;
-      *) AC_MSG_ERROR([bad value ${enableval} for --enable-system-shared-lib]) ;;
-    esac], [enable_system_shared_lib=false])
-AM_CONDITIONAL([USE_SYSTEM_SHARED_LIB], [test x$enable_system_shared_lib = xtrue])
-
 AC_ARG_ENABLE([documentation],
   AS_HELP_STRING([--disable-documentation], [do not build documentation]),
   [disable_documentation=true],
@@ -40,9 +28,9 @@ AM_CONDITIONAL([ENABLE_DOCUMENTATION], [test x$disable_documentation = xfalse])
 
 AM_COND_IF([ENABLE_DOCUMENTATION], [
   AC_PATH_PROG([ASCIIDOC], [asciidoc])
-  test x"${ASCIIDOC}" != x || AC_MSG_ERROR([Cannot find `asciidoc` in PATH.]) 
+  test x"${ASCIIDOC}" != x || AC_MSG_ERROR([Cannot find `asciidoc` in PATH.])
   AC_PATH_PROG([XMLTO], [xmlto])
-  test x"$XMLTO" != x || AC_MSG_ERROR([Cannot find `xmlto` in PATH.]) 
+  test x"$XMLTO" != x || AC_MSG_ERROR([Cannot find `xmlto` in PATH.])
   AC_PATH_PROG([GZIP], [gzip], [gzip])
   AC_PATH_PROG([MV], [mv], [mv])
   AC_PROG_SED
@@ -57,16 +45,11 @@ AC_PROG_LIBTOOL
 AC_PROG_MAKE_SET
 AC_LANG_SOURCE
 
-dnl Checks for libev
-AM_COND_IF([USE_SYSTEM_SHARED_LIB],
-  [],
-  [m4_include([libev/libev.m4])])
-
 dnl Add library for mingw
 case $host in
   *-mingw*)
     CFLAGS="$CFLAGS -mno-ms-bitfields"
-    LIBS="$LIBS -ladvapi32 -lgdi32 -lws2_32 -lcrypt32"
+    LIBS="$LIBS -lws2_32"
     ;;
   *-cygwin*)
     CFLAGS="$CFLAGS -mno-ms-bitfields"
@@ -77,38 +60,6 @@ esac
 
 dnl Checks for TLS
 AX_TLS([:], [:])
-
-dnl Checks for crypto library
-case "${with_crypto_library}" in
-  openssl)
-    ss_ZLIB
-    ss_OPENSSL
-    AC_DEFINE([USE_CRYPTO_OPENSSL], [1], [Use OpenSSL library])
-    ;;
-  polarssl)
-    ss_POLARSSL
-    AC_DEFINE([USE_CRYPTO_POLARSSL], [1], [Use PolarSSL library])
-    ;;
-  mbedtls)
-    ss_MBEDTLS
-    AC_DEFINE([USE_CRYPTO_MBEDTLS], [1], [Use mbed TLS library])
-    ;;
-esac
-
-dnl Checks for Apple CommonCrypto API
-AC_ARG_ENABLE(applecc,
-  AS_HELP_STRING([--enable-applecc], [enable Apple CommonCrypto API support]),
-  [
-    AC_CHECK_HEADERS(CommonCrypto/CommonCrypto.h,
-      [],
-      [AC_MSG_ERROR([CommonCrypto header files not found.]); break]
-    )
-    AC_CHECK_FUNCS([CCCryptorCreateWithMode], ,
-      [AC_MSG_ERROR([CommonCrypto API needs OS X (>= 10.7) and iOS (>= 5.0).]); break]
-    )
-    AC_DEFINE([USE_CRYPTO_APPLECC], [1], [Use Apple CommonCrypto library])
-  ]
-)
 
 dnl Checks for inet_ntop
 ss_FUNC_INET_NTOP
@@ -134,11 +85,6 @@ case $host in
     AC_MSG_RESULT(transparent proxy does not support for $host)
     ;;
 esac
-
-dnl Checks for pthread
-AX_PTHREAD([LIBS="$PTHREAD_LIBS $LIBS"
-            CFLAGS="$CFLAGS $PTHREAD_CFLAGS"
-            CC="$PTHREAD_CC"], AC_MSG_ERROR(Can not find pthreads.  This is required.))
 
 dnl Checks for stack protector
 GGL_CHECK_STACK_PROTECTOR([has_stack_protector=yes], [has_stack_protector=no])
@@ -285,29 +231,14 @@ AC_CHECK_LIB(socket, connect)
 dnl Checks for library functions.
 AC_CHECK_FUNCS([malloc memset socket])
 
-dnl Add define for libudns to enable IPv6 support
-dnl This is an option defined in the origin configure script
-AC_DEFINE([HAVE_IPv6], [1], [Enable IPv6 support in libudns])
-
-AM_COND_IF([USE_SYSTEM_SHARED_LIB],[
-    AC_CHECK_LIB([sodium], [sodium_init], ,[
-       AC_MSG_ERROR([Couldn't find libsodium. Try installing libsodium-dev@<:@el@:>@.])
-    ])
-  ],
-  [AC_CONFIG_SUBDIRS([libsodium])])
-
-AC_CONFIG_FILES([Makefile
-                 libcork/Makefile
-                 src/Makefile])
-AM_COND_IF([USE_SYSTEM_SHARED_LIB],[
-    AC_CHECK_LIB([udns], [dns_dnlen], ,[AC_MSG_ERROR([Couldn't find libudns. Try installing libudns-dev or udns-devel.])])
-    AC_CHECK_LIB([ev], [ev_loop_destroy], ,[AC_MSG_ERROR([Couldn't find libev. Try installing libev-dev@<:@el@:>@.])])
-  ],
-  [AC_CONFIG_FILES([libudns/Makefile
-                 libev/Makefile])])
+AC_CHECK_LIB([ev], [ev_loop_destroy], [LIBS="-lev $LIBS"], [AC_MSG_ERROR([Couldn't find libev. Try installing libev-dev@<:@el@:>@.])])
 
 AM_COND_IF([ENABLE_DOCUMENTATION],
   [AC_CONFIG_FILES([doc/Makefile])
 ])
+
+AC_CONFIG_FILES([Makefile
+                 libcork/Makefile
+                 src/Makefile])
 
 AC_OUTPUT

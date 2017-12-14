@@ -29,6 +29,7 @@
 #define MAX_CONNECT_TIMEOUT 10
 #define MAX_REQUEST_TIMEOUT 60
 #define MIN_UDP_TIMEOUT 10
+#define UPDATE_INTERVAL 5
 
 typedef struct {
     char *host;
@@ -50,12 +51,14 @@ typedef struct {
     char *user;
     char *obfs;
     char *obfs_host;
+    char *failover;
     int fast_open;
     int nofile;
     char *nameserver;
     char *dst_addr;
     int mptcp;
     int ipv6_first;
+    int reverse_proxy;
 } jconf_t;
 
 jconf_t *read_jconf(const char *file);
